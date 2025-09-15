@@ -1,86 +1,90 @@
-// worker.js
-const queue = require("./queue");
+require("dotenv").config();
+const { createClient } = require("redis");
+const { exec } = require("child_process");
 const fs = require("fs");
 const path = require("path");
-const { v4: uuid } = require("uuid");
-const { spawn } = require("child_process");
+const util = require("util");
 
-const TEMP_DIR = path.join(__dirname, "temp");
+const execPromise = util.promisify(exec);
+const TEMP_DIR = "./temp";
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR);
 
-function runCommand(command, args, cwd, timeout = 5000) {
-  return new Promise((resolve) => {
-    console.log(`Running: ${command} ${args.join(" ")}`);
-    const proc = spawn(command, args, { cwd });
-
-    let output = "";
-    let error = "";
-
-    const timer = setTimeout(() => {
-      proc.kill();
-      resolve({ output: "Error: Execution timed out" });
-    }, timeout);
-
-    proc.stdout.on("data", (data) => (output += data.toString()));
-    proc.stderr.on("data", (data) => (error += data.toString()));
-
-    proc.on("close", () => {
-      clearTimeout(timer);
-      if (error) resolve({ output: error });
-      else resolve({ output });
-    });
-  });
-}
-
-queue.process(async (job) => {
-  const { language, code } = job.data;
-  const id = uuid();
-  const folder = path.join(TEMP_DIR, id);
-  fs.mkdirSync(folder, { recursive: true });
-  let filePath;
-
-  try {
-    switch (language.toLowerCase()) {
-      case "python":
-        filePath = path.join(folder, "main.py");
-        fs.writeFileSync(filePath, code);
-        return await runCommand("python", [filePath], folder);
-
-      case "javascript":
-        filePath = path.join(folder, "main.js");
-        fs.writeFileSync(filePath, code);
-        return await runCommand("node", [filePath], folder);
-
-      case "c":
-        filePath = path.join(folder, "main.c");
-        fs.writeFileSync(filePath, code);
-        const cOut = path.join(folder, process.platform === "win32" ? "a.exe" : "a.out");
-        const compileC = await runCommand("gcc", [filePath, "-o", cOut], folder);
-        if (compileC.output) return compileC;
-        return await runCommand(cOut, [], folder);
-
-      case "cpp":
-        filePath = path.join(folder, "main.cpp");
-        fs.writeFileSync(filePath, code);
-        const cppOut = path.join(folder, process.platform === "win32" ? "a.exe" : "a.out");
-        const compileCpp = await runCommand("g++", [filePath, "-o", cppOut], folder);
-        if (compileCpp.output) return compileCpp;
-        return await runCommand(cppOut, [], folder);
-
-      case "java":
-        filePath = path.join(folder, "Main.java");
-        fs.writeFileSync(filePath, code);
-        const compileJava = await runCommand("javac", [filePath], folder);
-        if (compileJava.output) return compileJava;
-        return await runCommand("java", ["-cp", folder, "Main"], folder);
-
-      default:
-        return { output: "Unsupported language" };
-    }
-  } catch (err) {
-    return { output: err.message };
-  } finally {
-    fs.rmSync(folder, { recursive: true, force: true });
-    console.log("Cleaned up:", folder);
-  }
+// Redis client
+const redis = createClient({
+  url: process.env.REDIS_URL, // same as server
+  socket: { tls: true, rejectUnauthorized: false, connectTimeout: 10000 },
 });
+
+redis.on("error", (err) => console.error("Redis Client Error:", err));
+
+(async () => {
+  await redis.connect();
+  console.log("✅ Worker connected to Redis");
+
+  // Start processing jobs
+  while (true) {
+    const jobData = await redis.blPop("jobQueue", 0); // blocking pop
+    const job = JSON.parse(jobData.element);
+    console.log("Processing job:", job.id);
+
+    let filePath, command;
+
+    try {
+      switch (job.language) {
+        case "python":
+          filePath = path.join(TEMP_DIR, `${job.id}.py`);
+          fs.writeFileSync(filePath, job.code);
+          command = `python ${filePath}`;
+          break;
+        case "javascript":
+          filePath = path.join(TEMP_DIR, `${job.id}.js`);
+          fs.writeFileSync(filePath, job.code);
+          command = `node ${filePath}`;
+          break;
+        case "c":
+          filePath = path.join(TEMP_DIR, `${job.id}.c`);
+          const outC = path.join(TEMP_DIR, `${job.id}.out`);
+          fs.writeFileSync(filePath, job.code);
+          command = `gcc ${filePath} -o ${outC} && ${outC}`;
+          break;
+        case "cpp":
+          filePath = path.join(TEMP_DIR, `${job.id}.cpp`);
+          const outCpp = path.join(TEMP_DIR, `${job.id}.out`);
+          fs.writeFileSync(filePath, job.code);
+          command = `g++ ${filePath} -o ${outCpp} && ${outCpp}`;
+          break;
+        case "java":
+          filePath = path.join(TEMP_DIR, `${job.id}.java`);
+          fs.writeFileSync(filePath, job.code);
+          command = `javac ${filePath} && java -cp ${TEMP_DIR} Main`;
+          break;
+        default:
+          await redis.set(`result:${job.id}`, JSON.stringify({ status: "error", output: "Unsupported language" }));
+          continue;
+      }
+
+      let result;
+      try {
+        const { stdout } = await execPromise(command, { timeout: 5000 });
+        result = { status: "done", output: stdout };
+      } catch (err) {
+        result = { status: "error", output: err.stderr || err.message };
+      }
+
+      // cleanup
+      try { fs.rmSync(filePath, { force: true }); } catch {}
+      if (["c", "cpp"].includes(job.language)) {
+        try { fs.rmSync(path.join(TEMP_DIR, `${job.id}.out`), { force: true }); } catch {}
+      }
+      if (job.language === "java") {
+        try { fs.rmSync(path.join(TEMP_DIR, "Main.class"), { force: true }); } catch {}
+      }
+
+      await redis.set(`result:${job.id}`, JSON.stringify(result));
+      console.log("Job finished:", job.id);
+
+    } catch (e) {
+      await redis.set(`result:${job.id}`, JSON.stringify({ status: "error", output: e.message }));
+    }
+  }
+})();
