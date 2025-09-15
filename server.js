@@ -1,57 +1,63 @@
 const express = require("express");
 const bodyParser = require("body-parser");
-const Docker = require("dockerode");
 const cors = require("cors");
+const fs = require("fs");
+const { exec } = require("child_process");
+const path = require("path");
+const { v4: uuid } = require("uuid");
+
 const app = express();
-
-// Enable CORS
 app.use(cors());
-
-// Parse JSON bodies
 app.use(bodyParser.json());
 
-const docker = new Docker({ socketPath: "/var/run/docker.sock" });
+const TEMP_DIR = "./temp";
+if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR);
 
 app.post("/run", async (req, res) => {
-  const { language, code, input } = req.body;
+  const { language, code } = req.body;
+  if (!language || !code) return res.status(400).send("Missing language or code");
 
-  let image, command;
-  if (language === "cpp") {
-    image = "gcc:latest";
-    command = ["bash", "-c", "echo \"$CODE\" > main.cpp && g++ main.cpp -o main && ./main"];
-  } else if (language === "python") {
-    image = "python:3.11";
-    command = ["bash", "-c", "echo \"$CODE\" > main.py && python main.py"];
-  } else if (language === "java") {
-    image = "openjdk:17";
-    command = ["bash", "-c", "echo \"$CODE\" > Main.java && javac Main.java && java Main"];
-  } else {
-    return res.status(400).send("Unsupported language");
-  }
+  const id = uuid(); // unique filename
+  let filePath, command;
 
   try {
-    const container = await docker.createContainer({
-      Image: image,
-      Cmd: command,
-      Env: [`CODE=${code}`, `INPUT=${input}`],
-      AttachStdout: true,
-      AttachStderr: true,
-      Tty: false
+    if (language === "python") {
+      filePath = path.join(TEMP_DIR, `${id}.py`);
+      fs.writeFileSync(filePath, code);
+      command = `python3 ${filePath}`;
+    } else if (language === "javascript") {
+      filePath = path.join(TEMP_DIR, `${id}.js`);
+      fs.writeFileSync(filePath, code);
+      command = `node ${filePath}`;
+    } else if (language === "cpp") {
+      filePath = path.join(TEMP_DIR, `${id}.cpp`);
+      const outFile = path.join(TEMP_DIR, `${id}.out`);
+      fs.writeFileSync(filePath, code);
+      command = `g++ ${filePath} -o ${outFile} && ${outFile}`;
+    } else if (language === "c") {
+      filePath = path.join(TEMP_DIR, `${id}.c`);
+      const outFile = path.join(TEMP_DIR, `${id}.out`);
+      fs.writeFileSync(filePath, code);
+      command = `gcc ${filePath} -o ${outFile} && ${outFile}`;
+    } else if (language === "java") {
+      filePath = path.join(TEMP_DIR, `${id}.java`);
+      fs.writeFileSync(filePath, code);
+      command = `javac ${filePath} && java -cp ${TEMP_DIR} Main`; // assume class name Main
+    } else {
+      return res.status(400).send("Unsupported language");
+    }
+
+    exec(command, { timeout: 5000 }, (err, stdout, stderr) => {
+      // clean up files
+      fs.rmSync(filePath, { force: true });
+      if (language === "cpp" || language === "c") fs.rmSync(path.join(TEMP_DIR, `${id}.out`), { force: true });
+      if (language === "java") fs.rmSync(path.join(TEMP_DIR, "Main.class"), { force: true });
+
+      if (err) return res.json({ output: stderr || err.message });
+      res.json({ output: stdout });
     });
-
-    await container.start();
-
-    const stream = await container.attach({ stream: true, stdout: true, stderr: true });
-    let output = "";
-    stream.on("data", (chunk) => (output += chunk.toString()));
-
-    await container.wait();
-    await container.remove();
-
-    res.send({ output });
   } catch (err) {
-    console.error(err);
-    res.status(500).send("Error running code");
+    return res.json({ output: err.message });
   }
 });
 
