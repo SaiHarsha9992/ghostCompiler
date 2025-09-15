@@ -1,7 +1,6 @@
-# Base Node.js image
 FROM node:18
 
-# Install compilers/interpreters
+# Install compilers
 RUN apt-get update && apt-get install -y \
     python3 python3-pip \
     g++ gcc \
@@ -11,7 +10,6 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy app files
 COPY package*.json ./
 RUN npm install
 COPY . .

@@ -11,8 +11,12 @@
   "description": "",
   "dependencies": {
     "body-parser": "^2.2.0",
+    "bull": "^4.16.5",
+    "bullmq": "^5.58.5",
     "cors": "^2.8.5",
     "dockerode": "^4.0.8",
-    "express": "^5.1.0"
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "ioredis": "^5.7.0"
   }
 }
